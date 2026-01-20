@@ -49,8 +49,19 @@ def forecast_one(clf, home: str, away: str, ou_line: float, ah_line: float):
     p_under = 1.0 - p_over
 
     # BTTS
-    p_btts_yes = float(probs.both_teams_to_score)
+# BTTS (version-safe)
+if hasattr(probs, "both_teams_to_score"):
+    p_btts_yes = float(probs.both_teams_to_score)  # shown in penaltyblog docs :contentReference[oaicite:1]{index=1}
     p_btts_no = 1.0 - p_btts_yes
+elif hasattr(probs, "btts_yes") and hasattr(probs, "btts_no"):
+    p_btts_yes = float(probs.btts_yes)  # added as explicit markets in newer grid :contentReference[oaicite:2]{index=2}
+    p_btts_no = float(probs.btts_no)
+else:
+    raise AttributeError(
+        "Could not find BTTS probability on FootballProbabilityGrid. "
+        "Tried: both_teams_to_score, btts_yes/btts_no."
+    )
+
 
     # Asian handicap (home side)
     p_ah_home = float(probs.asian_handicap("home", ah_line))
