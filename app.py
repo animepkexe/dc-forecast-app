@@ -2,14 +2,13 @@ import io
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 import penaltyblog as pb
 
 st.set_page_config(page_title="Dixon–Coles Forecasting", layout="wide")
 
-REQUIRED_RESULTS_COLS = {"team_home", "team_away", "goals_home", "goals_away"}
-
 # -------------------------
-# Helpers
+# Core helpers
 # -------------------------
 def safe_float(x):
     try:
@@ -35,51 +34,47 @@ def fmt_odds(o: float, decimals: int = 2) -> str:
         return ""
     return f"{o:.{decimals}f}"
 
-def validate_columns(df: pd.DataFrame, required: set, name: str):
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"{name} is missing required columns: {sorted(missing)}")
+def parse_date_series_dayfirst(s: pd.Series) -> pd.Series:
+    # Your format is 17/08/2024 -> dayfirst=True
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
+def ev_percent(p: float, betfair_odds: float, commission: float) -> float:
+    """
+    For £1 stake, with Betfair commission on winnings:
+      net_return = 1 + (odds-1)*(1-commission)
+      EV = p*net_return - 1
+      EV% = 100*EV
+    """
+    p = safe_float(p)
+    o = safe_float(betfair_odds)
+    c = safe_float(commission)
+    if np.isnan(p) or np.isnan(o) or o <= 1 or p <= 0 or p >= 1 or c < 0 or c >= 1:
+        return np.nan
+    net_return = 1.0 + (o - 1.0) * (1.0 - c)
+    ev = p * net_return - 1.0
+    return 100.0 * ev
+
+# -------------------------
+# CSV IO
+# -------------------------
 @st.cache_data(show_spinner=False)
 def read_csv(uploaded_file) -> pd.DataFrame:
     content = uploaded_file.getvalue()
     return pd.read_csv(io.BytesIO(content))
 
-def parse_date_series_dayfirst(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", dayfirst=True)
-
-def has_date_column(df: pd.DataFrame) -> bool:
-    return "date" in df.columns
-
 # -------------------------
-# Model fitting
+# penaltyblog fit (supports weights in newer versions)
 # -------------------------
 @st.cache_resource(show_spinner=True)
-def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradient: bool):
+def fit_dc_model(home_goals, away_goals, home_teams, away_teams, weights=None, use_gradient=True):
     try:
-        model = pb.models.DixonColesGoalModel(
-            results_df["goals_home"],
-            results_df["goals_away"],
-            results_df["team_home"],
-            results_df["team_away"],
-            weights=weights,
-        )
+        model = pb.models.DixonColesGoalModel(home_goals, away_goals, home_teams, away_teams, weights=weights)
     except TypeError:
+        # older signature
         if weights is None:
-            model = pb.models.DixonColesGoalModel(
-                results_df["goals_home"],
-                results_df["goals_away"],
-                results_df["team_home"],
-                results_df["team_away"],
-            )
+            model = pb.models.DixonColesGoalModel(home_goals, away_goals, home_teams, away_teams)
         else:
-            model = pb.models.DixonColesGoalModel(
-                results_df["goals_home"],
-                results_df["goals_away"],
-                results_df["team_home"],
-                results_df["team_away"],
-                weights,
-            )
+            model = pb.models.DixonColesGoalModel(home_goals, away_goals, home_teams, away_teams, weights)
 
     try:
         model.fit(use_gradient=use_gradient)
@@ -89,7 +84,7 @@ def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradi
     return model
 
 # -------------------------
-# Grid helpers
+# Probability grid market helpers (version-safe)
 # -------------------------
 def get_btts_probs(grid):
     if hasattr(grid, "btts_yes") and hasattr(grid, "btts_no"):
@@ -142,45 +137,195 @@ def win_to_nil_probs(grid):
     return p_home, p_away
 
 # -------------------------
-# EV calculation
+# Backtest utilities
 # -------------------------
-def ev_percent(p: float, betfair_odds: float, commission: float) -> float:
-    p = safe_float(p)
-    o = safe_float(betfair_odds)
-    c = safe_float(commission)
-    if np.isnan(p) or np.isnan(o) or o <= 1 or p <= 0 or p >= 1 or c < 0 or c >= 1:
-        return np.nan
-    net_return = 1.0 + (o - 1.0) * (1.0 - c)
-    ev = p * net_return - 1.0
-    return 100.0 * ev
+def odds_to_probs_1x2(oh, od, oa):
+    """
+    Convert 1X2 odds -> implied probs and remove overround.
+    Returns (pH, pD, pA) or (nan,nan,nan) if invalid.
+    """
+    oh, od, oa = safe_float(oh), safe_float(od), safe_float(oa)
+    if any(np.isnan(x) for x in (oh, od, oa)) or oh <= 1 or od <= 1 or oa <= 1:
+        return np.nan, np.nan, np.nan
+    pH, pD, pA = 1.0/oh, 1.0/od, 1.0/oa
+    s = pH + pD + pA
+    if s <= 0:
+        return np.nan, np.nan, np.nan
+    return pH/s, pD/s, pA/s
+
+def log_loss_multiclass(p_vec, y_idx, eps=1e-15):
+    p = np.array(p_vec, dtype=float)
+    p = np.clip(p, eps, 1 - eps)
+    p = p / p.sum()
+    return -np.log(p[int(y_idx)])
+
+def brier_multiclass(p_vec, y_idx):
+    p = np.array(p_vec, dtype=float)
+    p = p / p.sum()
+    y = np.zeros_like(p)
+    y[int(y_idx)] = 1.0
+    return float(np.sum((p - y) ** 2))
+
+def result_to_index(ftr: str):
+    # Football-Data: "H","D","A"
+    if ftr == "H":
+        return 0
+    if ftr == "D":
+        return 1
+    if ftr == "A":
+        return 2
+    return None
+
+@st.cache_data(show_spinner=True)
+def run_walk_forward_backtest(df: pd.DataFrame, xi: float, use_time_decay: bool, use_gradient: bool,
+                              min_train_matches: int, max_goals: int):
+    """
+    Expanding-window walk-forward backtest:
+      For each match i, fit on matches < i, predict i, compare vs Max odds implied probs.
+    Returns per-match dataframe + summary.
+    """
+    # Sort by date
+    df = df.sort_values("date").reset_index(drop=True)
+
+    rows = []
+    # Precompute weights if possible (for full set) then slice; penaltyblog helper expects date series
+    # If not available in installed pb version, we fall back to None.
+    weights_full = None
+    if use_time_decay:
+        try:
+            weights_full = pb.models.dixon_coles_weights(df["date"], xi)
+        except Exception:
+            weights_full = None
+
+    for i in range(len(df)):
+        if i < min_train_matches:
+            continue
+
+        train = df.iloc[:i]
+        test = df.iloc[i]
+
+        # Training arrays
+        home_goals = train["FTHG"].astype(float)
+        away_goals = train["FTAG"].astype(float)
+        home_teams = train["HomeTeam"].astype(str)
+        away_teams = train["AwayTeam"].astype(str)
+
+        weights = None
+        if use_time_decay and weights_full is not None:
+            weights = np.array(weights_full[:i], dtype=float)
+
+        # Fit model
+        try:
+            model = fit_dc_model(home_goals, away_goals, home_teams, away_teams, weights=weights, use_gradient=use_gradient)
+        except Exception:
+            # If optimisation fails for some prefix, skip this test point
+            continue
+
+        # Predict
+        try:
+            try:
+                grid = model.predict(str(test["HomeTeam"]), str(test["AwayTeam"]), max_goals=max_goals, normalize=True)
+            except TypeError:
+                grid = model.predict(str(test["HomeTeam"]), str(test["AwayTeam"]))
+            pH_m, pD_m, pA_m = grid.home_draw_away
+            pH_m, pD_m, pA_m = safe_float(pH_m), safe_float(pD_m), safe_float(pA_m)
+        except Exception:
+            continue
+
+        # Market probs from Max odds
+        pH_k, pD_k, pA_k = odds_to_probs_1x2(test["MaxH"], test["MaxD"], test["MaxA"])
+
+        y = result_to_index(str(test["FTR"]))
+        if y is None:
+            continue
+        if any(np.isnan(x) for x in (pH_k, pD_k, pA_k)):
+            # If no odds, skip (since comparison to market is requested)
+            continue
+
+        # Scores
+        ll_model = log_loss_multiclass([pH_m, pD_m, pA_m], y)
+        ll_mkt = log_loss_multiclass([pH_k, pD_k, pA_k], y)
+        br_model = brier_multiclass([pH_m, pD_m, pA_m], y)
+        br_mkt = brier_multiclass([pH_k, pD_k, pA_k], y)
+
+        rows.append({
+            "date": test["date"],
+            "HomeTeam": test["HomeTeam"],
+            "AwayTeam": test["AwayTeam"],
+            "FTR": test["FTR"],
+            "pH_model": pH_m, "pD_model": pD_m, "pA_model": pA_m,
+            "pH_mkt": pH_k, "pD_mkt": pD_k, "pA_mkt": pA_k,
+            "ll_model": ll_model, "ll_mkt": ll_mkt,
+            "brier_model": br_model, "brier_mkt": br_mkt,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out, {}
+
+    summary = {
+        "n": int(len(out)),
+        "logloss_model": float(out["ll_model"].mean()),
+        "logloss_market": float(out["ll_mkt"].mean()),
+        "brier_model": float(out["brier_model"].mean()),
+        "brier_market": float(out["brier_mkt"].mean()),
+    }
+    summary["logloss_diff_model_minus_market"] = summary["logloss_model"] - summary["logloss_market"]
+    summary["brier_diff_model_minus_market"] = summary["brier_model"] - summary["brier_market"]
+
+    return out, summary
+
+def calibration_table(out_df: pd.DataFrame, which: str, bins: int = 10):
+    """
+    Simple calibration for HOME win probability:
+    bucket predicted p_home into bins, compare avg p vs actual frequency.
+    which: 'model' or 'mkt'
+    """
+    col = "pH_model" if which == "model" else "pH_mkt"
+    df = out_df.copy()
+    df["home_win"] = (df["FTR"] == "H").astype(int)
+    df = df.dropna(subset=[col])
+    df["bin"] = pd.cut(df[col], bins=bins, labels=False, include_lowest=True)
+    g = df.groupby("bin").agg(
+        n=("home_win", "size"),
+        avg_p=(col, "mean"),
+        freq=("home_win", "mean"),
+    ).reset_index()
+    g["avg_p"] = g["avg_p"].astype(float)
+    g["freq"] = g["freq"].astype(float)
+    return g
 
 # -------------------------
-# App
+# App header
 # -------------------------
 st.title("⚽ Dixon–Coles Forecasting (Penaltyblog)")
-st.caption("Fit the model, pick two teams, then enter Betfair odds to get EV% + value.")
+st.caption("Forecast a match + enter Betfair odds for EV, and backtest vs Max market odds (1X2).")
 
-# Initialise session state for forecast persistence
+# session state for forecast persistence
 if "last_forecast" not in st.session_state:
-    st.session_state["last_forecast"] = None  # will hold dict with key info + market_df
+    st.session_state["last_forecast"] = None
 if "bf_inputs" not in st.session_state:
-    st.session_state["bf_inputs"] = {}  # mapping (market, selection) -> odds
+    st.session_state["bf_inputs"] = {}
 
+# -------------------------
+# Sidebar controls
+# -------------------------
 with st.sidebar:
-    st.subheader("Step 1 — Upload historical results")
-    results_file = st.file_uploader("results.csv", type=["csv"], label_visibility="collapsed")
+    st.subheader("Upload data")
+    st.write("Use your historical CSV (e.g., Football-Data E0).")
+    results_file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
 
     st.divider()
     st.subheader("Model options")
-    use_time_decay = st.checkbox("Use time-decay weighting (requires 'date')", value=True)
+    use_time_decay = st.checkbox("Use time-decay weighting (requires Date)", value=True)
     xi = st.slider("Decay factor (xi)", 0.0, 0.01, 0.001, 0.0005)
     use_gradient = st.checkbox("Use gradient optimisation (if supported)", value=True)
 
     st.divider()
-    st.subheader("Markets")
+    st.subheader("Markets (Forecast tab)")
     include_1x2 = st.checkbox("1X2", value=True)
-    include_double_chance = st.checkbox("Double Chance (1X / X2 / 12)", value=True)
-    include_dnb = st.checkbox("Draw No Bet (Home/Away)", value=True)
+    include_double_chance = st.checkbox("Double Chance", value=True)
+    include_dnb = st.checkbox("Draw No Bet", value=True)
 
     include_ou = st.checkbox("Over/Under", value=True)
     ou_line = st.selectbox("O/U line", [0.5, 1.5, 2.5, 3.5], index=2, disabled=not include_ou)
@@ -193,7 +338,7 @@ with st.sidebar:
     include_exact_score = st.checkbox("Exact Score (Top N)", value=True)
     top_n_scores = st.slider("Top N scorelines", 5, 30, 10, disabled=not include_exact_score)
 
-    include_win_to_nil = st.checkbox("Win to Nil (Home/Away)", value=True)
+    include_win_to_nil = st.checkbox("Win to Nil", value=True)
 
     st.divider()
     st.subheader("Betfair EV")
@@ -205,81 +350,94 @@ with st.sidebar:
     prob_decimals = st.selectbox("Probability % decimals", [0, 1, 2], index=1)
     odds_decimals = st.selectbox("Odds decimals", [2, 3], index=0)
 
-tab_fit, tab_forecast, tab_help = st.tabs(["1) Upload & Fit", "2) Forecast + Betfair EV", "Help"])
+# -------------------------
+# Tabs
+# -------------------------
+tab_fit, tab_forecast, tab_backtest, tab_help = st.tabs(
+    ["1) Fit", "2) Forecast + Betfair EV", "3) Backtest vs Max Odds", "Help"]
+)
 
 # -------------------------
-# Fit tab
+# Fit tab: load CSV, standardize columns, fit "global" model for forecasting UI
 # -------------------------
 with tab_fit:
     if not results_file:
-        st.info("Upload **results.csv** from the sidebar to begin.")
+        st.info("Upload your historical CSV in the sidebar to begin.")
         st.stop()
 
     try:
-        results_df = read_csv(results_file)
-        validate_columns(results_df, REQUIRED_RESULTS_COLS, "results.csv")
+        raw = read_csv(results_file)
     except Exception as e:
-        st.error(f"Could not read results.csv: {e}")
+        st.error(f"Could not read CSV: {e}")
         st.stop()
 
-    for c in ["goals_home", "goals_away"]:
-        results_df[c] = pd.to_numeric(results_df[c], errors="coerce")
+    # Map Football-Data names -> internal names (for forecast tab fit)
+    required = {"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"}
+    missing = required - set(raw.columns)
+    if missing:
+        st.error(f"CSV missing required columns: {sorted(missing)}")
+        st.stop()
 
-    results_df = results_df.dropna(subset=["team_home", "team_away", "goals_home", "goals_away"]).copy()
-    results_df["team_home"] = results_df["team_home"].astype(str)
-    results_df["team_away"] = results_df["team_away"].astype(str)
+    df = raw.copy()
+    df["date"] = parse_date_series_dayfirst(df["Date"])
+    df = df.dropna(subset=["date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]).copy()
 
-    date_ok = False
-    if has_date_column(results_df):
-        results_df["date"] = parse_date_series_dayfirst(results_df["date"])
-        if results_df["date"].notna().any():
-            date_ok = True
+    df["FTHG"] = pd.to_numeric(df["FTHG"], errors="coerce")
+    df["FTAG"] = pd.to_numeric(df["FTAG"], errors="coerce")
+    df = df.dropna(subset=["FTHG", "FTAG"]).copy()
 
-    if use_time_decay and not date_ok:
-        st.warning("Time-decay is enabled but no usable 'date' column was found. It will be ignored.")
+    # Optional date filter for training
+    min_d = df["date"].min()
+    max_d = df["date"].max()
 
-    if date_ok:
-        min_d = results_df["date"].min()
-        max_d = results_df["date"].max()
-        d1, d2 = st.slider(
-            "Filter historical matches used for fitting",
-            min_value=min_d.to_pydatetime(),
-            max_value=max_d.to_pydatetime(),
-            value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
-        )
-        mask = (results_df["date"] >= pd.Timestamp(d1)) & (results_df["date"] <= pd.Timestamp(d2))
-        train_df = results_df.loc[mask].copy()
-    else:
-        train_df = results_df
-
-    teams = sorted(set(train_df["team_home"]).union(set(train_df["team_away"])))
+    d1, d2 = st.slider(
+        "Training date range",
+        min_value=min_d.to_pydatetime(),
+        max_value=max_d.to_pydatetime(),
+        value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
+    )
+    train_df = df[(df["date"] >= pd.Timestamp(d1)) & (df["date"] <= pd.Timestamp(d2))].copy()
+    train_df = train_df.sort_values("date").reset_index(drop=True)
 
     weights = None
-    if use_time_decay and date_ok:
-        weights = pb.models.dixon_coles_weights(train_df["date"], xi)
-
-    with st.spinner("Fitting Dixon–Coles model..."):
+    if use_time_decay:
         try:
-            clf = fit_dc_model(train_df, weights=weights, use_gradient=use_gradient)
+            weights = pb.models.dixon_coles_weights(train_df["date"], xi)
+        except Exception:
+            weights = None
+            st.warning("Time-decay weights not available in this environment; fitting without weights.")
+
+    with st.spinner("Fitting Dixon–Coles model for forecasting..."):
+        try:
+            clf = fit_dc_model(
+                train_df["FTHG"].astype(float),
+                train_df["FTAG"].astype(float),
+                train_df["HomeTeam"].astype(str),
+                train_df["AwayTeam"].astype(str),
+                weights=weights,
+                use_gradient=use_gradient
+            )
         except Exception as e:
             st.error(f"Model fit failed: {e}")
             st.stop()
 
+    teams = sorted(set(train_df["HomeTeam"]).union(set(train_df["AwayTeam"])))
     st.success("Model fitted ✅")
-    st.session_state["clf"] = clf
-    st.session_state["teams"] = teams
-
     c1, c2, c3 = st.columns(3)
     c1.metric("Matches used", f"{len(train_df):,}")
     c2.metric("Teams", f"{len(teams):,}")
-    c3.metric("Time-decay", "On" if (use_time_decay and date_ok) else "Off")
+    c3.metric("Time-decay", "On" if (use_time_decay and weights is not None) else "Off")
+
+    st.session_state["clf"] = clf
+    st.session_state["teams"] = teams
+    st.session_state["hist_df_for_backtest"] = df  # store cleaned df for backtest
 
 # -------------------------
-# Forecast + EV tab
+# Forecast + EV tab (single match)
 # -------------------------
 with tab_forecast:
-    if "clf" not in st.session_state:
-        st.info("Fit the model first in **Upload & Fit**.")
+    if "clf" not in st.session_state or "teams" not in st.session_state:
+        st.info("Fit the model first in the **Fit** tab.")
         st.stop()
 
     clf = st.session_state["clf"]
@@ -298,31 +456,31 @@ with tab_forecast:
         st.error("Home and Away cannot be the same team.")
         st.stop()
 
-    # Decide whether to use cached forecast or re-run
-    # Re-run if user clicked Run, or if no cached result, or if cached teams differ
+    # Rerun logic: cache the simulation so typing odds doesn't bounce back
     cached = st.session_state["last_forecast"]
+    settings_sig = {
+        "include_1x2": include_1x2,
+        "include_double_chance": include_double_chance,
+        "include_dnb": include_dnb,
+        "include_ou": include_ou,
+        "ou_line": float(ou_line),
+        "include_btts": include_btts,
+        "include_ah": include_ah,
+        "ah_line": float(ah_line),
+        "include_exact_score": include_exact_score,
+        "top_n_scores": int(top_n_scores),
+        "include_win_to_nil": include_win_to_nil,
+    }
+
     need_rerun = (
         run_clicked
         or cached is None
         or cached.get("home") != home_team
         or cached.get("away") != away_team
-        or cached.get("settings") != {
-            "include_1x2": include_1x2,
-            "include_double_chance": include_double_chance,
-            "include_dnb": include_dnb,
-            "include_ou": include_ou,
-            "ou_line": float(ou_line),
-            "include_btts": include_btts,
-            "include_ah": include_ah,
-            "ah_line": float(ah_line),
-            "include_exact_score": include_exact_score,
-            "top_n_scores": int(top_n_scores),
-            "include_win_to_nil": include_win_to_nil,
-        }
+        or cached.get("settings") != settings_sig
     )
 
     if need_rerun:
-        # Clear Betfair inputs when simulation settings change (optional but usually desired)
         st.session_state["bf_inputs"] = {}
 
         try:
@@ -389,9 +547,9 @@ with tab_forecast:
         # Exact score Top N
         if include_exact_score and hasattr(grid, "exact_score"):
             candidates = []
-            max_goals = 8
-            for hg in range(0, max_goals + 1):
-                for ag in range(0, max_goals + 1):
+            maxg = 8
+            for hg in range(0, maxg + 1):
+                for ag in range(0, maxg + 1):
                     p = exact_score_prob(grid, hg, ag)
                     if not np.isnan(p) and p > 0:
                         candidates.append((hg, ag, p))
@@ -400,34 +558,20 @@ with tab_forecast:
                 rows.append([fixture_label, "Correct Score", f"{hg}-{ag}", p, implied_decimal_odds(p)])
 
         market_df = pd.DataFrame(rows, columns=["fixture", "market", "selection", "model_prob", "model_odds"])
-
         st.session_state["last_forecast"] = {
             "home": home_team,
             "away": away_team,
-            "settings": {
-                "include_1x2": include_1x2,
-                "include_double_chance": include_double_chance,
-                "include_dnb": include_dnb,
-                "include_ou": include_ou,
-                "ou_line": float(ou_line),
-                "include_btts": include_btts,
-                "include_ah": include_ah,
-                "ah_line": float(ah_line),
-                "include_exact_score": include_exact_score,
-                "top_n_scores": int(top_n_scores),
-                "include_win_to_nil": include_win_to_nil,
-            },
+            "settings": settings_sig,
             "market_df": market_df,
         }
 
-    # From here on, ALWAYS render the editor using cached results
     cached = st.session_state["last_forecast"]
     market_df = cached["market_df"].copy()
 
     st.markdown("### Model outputs + enter Betfair odds")
     st.caption("Edits rerun the app, but your latest simulation stays on screen.")
 
-    # Add betfair odds column from session (persist across reruns)
+    # populate betfair odds from session map
     def get_bf(mkt, sel):
         return st.session_state["bf_inputs"].get((mkt, sel), np.nan)
 
@@ -447,13 +591,12 @@ with tab_forecast:
         key="bf_editor",
     )
 
-    # Persist any new edits back into session_state
+    # store edits
     new_map = {}
     for _, r in edited.iterrows():
         new_map[(r["market"], r["selection"])] = safe_float(r["betfair_odds"])
     st.session_state["bf_inputs"] = new_map
 
-    # Compute EV + value
     out = edited.copy()
     out["EV_%"] = out.apply(lambda r: ev_percent(r["model_prob"], r["betfair_odds"], commission), axis=1)
     out["Value"] = out["EV_%"].apply(lambda x: (not np.isnan(safe_float(x))) and (safe_float(x) > 0.0))
@@ -483,21 +626,161 @@ with tab_forecast:
     )
 
 # -------------------------
+# Backtest tab (1X2 vs MaxH/MaxD/MaxA)
+# -------------------------
+with tab_backtest:
+    if "hist_df_for_backtest" not in st.session_state:
+        st.info("Upload and fit first in the **Fit** tab.")
+        st.stop()
+
+    df = st.session_state["hist_df_for_backtest"].copy()
+
+    # Validate required backtest columns
+    needed = {"date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR", "MaxH", "MaxD", "MaxA"}
+    missing = needed - set(df.columns)
+    if missing:
+        st.error(f"Your CSV is missing required backtest columns: {sorted(missing)}")
+        st.stop()
+
+    df["MaxH"] = pd.to_numeric(df["MaxH"], errors="coerce")
+    df["MaxD"] = pd.to_numeric(df["MaxD"], errors="coerce")
+    df["MaxA"] = pd.to_numeric(df["MaxA"], errors="coerce")
+
+    df["FTHG"] = pd.to_numeric(df["FTHG"], errors="coerce")
+    df["FTAG"] = pd.to_numeric(df["FTAG"], errors="coerce")
+
+    df = df.dropna(subset=["date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR", "MaxH", "MaxD", "MaxA"]).copy()
+    df = df.sort_values("date").reset_index(drop=True)
+
+    st.markdown("### Backtest settings (1X2 vs Max odds)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        min_train = st.number_input("Minimum training matches", min_value=200, max_value=5000, value=760, step=50,
+                                    help="Roughly 2 seasons for Premier League (380*2).")
+    with c2:
+        max_goals = st.number_input("Max goals in model grid", min_value=8, max_value=20, value=15, step=1)
+    with c3:
+        bins = st.number_input("Calibration bins (home win)", min_value=5, max_value=20, value=10, step=1)
+
+    # Date range selection
+    min_d = df["date"].min()
+    max_d = df["date"].max()
+    d1, d2 = st.slider(
+        "Evaluation date range",
+        min_value=min_d.to_pydatetime(),
+        max_value=max_d.to_pydatetime(),
+        value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
+        help="This filters which matches are evaluated; training still uses all prior matches within the uploaded set."
+    )
+
+    eval_df = df[(df["date"] >= pd.Timestamp(d1)) & (df["date"] <= pd.Timestamp(d2))].copy()
+    if eval_df.empty:
+        st.warning("No matches in that evaluation range.")
+        st.stop()
+
+    run_bt = st.button("Run backtest", type="primary")
+    if not run_bt:
+        st.stop()
+
+    # Run (cached) walk-forward on the *full* df but we'll display within eval range
+    out_all, summary = run_walk_forward_backtest(
+        df=df,
+        xi=float(xi),
+        use_time_decay=bool(use_time_decay),
+        use_gradient=bool(use_gradient),
+        min_train_matches=int(min_train),
+        max_goals=int(max_goals),
+    )
+
+    if out_all.empty:
+        st.error("Backtest produced no results. Try lowering minimum training matches or check your CSV content.")
+        st.stop()
+
+    out = out_all[(out_all["date"] >= pd.Timestamp(d1)) & (out_all["date"] <= pd.Timestamp(d2))].copy()
+    if out.empty:
+        st.warning("No evaluated matches after filtering (might be due to missing odds or min_train setting).")
+        st.stop()
+
+    st.subheader("Summary (lower is better)")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Matches evaluated", f"{len(out):,}")
+    s2.metric("Log loss (Model)", f"{out['ll_model'].mean():.4f}")
+    s3.metric("Log loss (Market Max)", f"{out['ll_mkt'].mean():.4f}")
+    s4.metric("Model − Market", f"{(out['ll_model'].mean() - out['ll_mkt'].mean()):+.4f}")
+
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Brier (Model)", f"{out['brier_model'].mean():.4f}")
+    t2.metric("Brier (Market Max)", f"{out['brier_mkt'].mean():.4f}")
+    t3.metric("Model − Market", f"{(out['brier_model'].mean() - out['brier_mkt'].mean()):+.4f}")
+    t4.metric("Time-decay", "On" if use_time_decay else "Off")
+
+    st.markdown("### Cumulative log loss (Model vs Market)")
+    plot_df = out.sort_values("date").copy()
+    plot_df["cum_ll_model"] = plot_df["ll_model"].cumsum()
+    plot_df["cum_ll_mkt"] = plot_df["ll_mkt"].cumsum()
+
+    fig = plt.figure()
+    plt.plot(plot_df["date"], plot_df["cum_ll_model"], label="Model")
+    plt.plot(plot_df["date"], plot_df["cum_ll_mkt"], label="Market (Max)")
+    plt.legend()
+    plt.xlabel("Date")
+    plt.ylabel("Cumulative log loss")
+    st.pyplot(fig)
+
+    st.markdown("### Calibration (Home win probability)")
+    cal_model = calibration_table(out, which="model", bins=int(bins))
+    cal_mkt = calibration_table(out, which="mkt", bins=int(bins))
+
+    colL, colR = st.columns(2)
+    with colL:
+        st.write("Model")
+        show = cal_model.copy()
+        show["avg_p"] = show["avg_p"].apply(lambda x: fmt_prob(x, 1))
+        show["freq"] = show["freq"].apply(lambda x: fmt_prob(x, 1))
+        st.dataframe(show, use_container_width=True)
+    with colR:
+        st.write("Market (Max)")
+        show = cal_mkt.copy()
+        show["avg_p"] = show["avg_p"].apply(lambda x: fmt_prob(x, 1))
+        show["freq"] = show["freq"].apply(lambda x: fmt_prob(x, 1))
+        st.dataframe(show, use_container_width=True)
+
+    st.markdown("### Per-match details")
+    st.dataframe(
+        plot_df[[
+            "date","HomeTeam","AwayTeam","FTR",
+            "pH_model","pD_model","pA_model",
+            "pH_mkt","pD_mkt","pA_mkt",
+            "ll_model","ll_mkt","brier_model","brier_mkt"
+        ]],
+        use_container_width=True
+    )
+
+    st.download_button(
+        "Download backtest results CSV",
+        data=plot_df.to_csv(index=False).encode("utf-8"),
+        file_name="backtest_1x2_vs_max.csv",
+        mime="text/csv",
+    )
+
+# -------------------------
 # Help tab
 # -------------------------
 with tab_help:
-    st.markdown("### results.csv columns")
-    st.code("team_home, team_away, goals_home, goals_away", language="text")
-    st.markdown("Optional (recommended):")
-    st.code("date  (your format: 17/08/2024)", language="text")
+    st.markdown("### Expected CSV (Football-Data style)")
+    st.code("Date, HomeTeam, AwayTeam, FTHG, FTAG, FTR, MaxH, MaxD, MaxA", language="text")
 
-    st.markdown("### EV% definition")
+    st.markdown("### What the backtest does")
     st.markdown(
-        "For £1 stake, with Betfair commission on winnings:\n\n"
-        "- net_return = 1 + (odds − 1) × (1 − commission)\n"
-        "- EV = p × net_return − 1\n"
-        "- EV% = 100 × EV\n\n"
-        "Value = EV% > 0"
+        "- Walk-forward expanding window: for each match, fit on all prior matches.\n"
+        "- Compare your model vs market-implied probabilities from Max odds (overround removed).\n"
+        "- Report log loss and Brier score (lower is better).\n"
+    )
+
+    st.markdown("### Interpreting results")
+    st.markdown(
+        "- If **Model − Market** is negative (log loss), your model is beating the Max-odds benchmark on that sample.\n"
+        "- If it’s positive, the market is better calibrated (still useful: it shows where to improve).\n"
     )
 
 
