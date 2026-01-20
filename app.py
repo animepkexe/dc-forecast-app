@@ -7,7 +7,6 @@ import penaltyblog as pb
 st.set_page_config(page_title="Dixon–Coles Forecasting", layout="wide")
 
 REQUIRED_RESULTS_COLS = {"team_home", "team_away", "goals_home", "goals_away"}
-REQUIRED_FIXTURE_COLS = {"team_home", "team_away"}
 
 # -------------------------
 # Helpers
@@ -47,14 +46,13 @@ def read_csv(uploaded_file) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(content))
 
 def parse_date_series_dayfirst(s: pd.Series) -> pd.Series:
-    # Your format is 17/08/2024 => dayfirst=True
     return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
 def has_date_column(df: pd.DataFrame) -> bool:
     return "date" in df.columns
 
 # -------------------------
-# penaltyblog model fitting (supports weights in newer versions)
+# Model fitting
 # -------------------------
 @st.cache_resource(show_spinner=True)
 def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradient: bool):
@@ -67,7 +65,6 @@ def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradi
             weights=weights,
         )
     except TypeError:
-        # Older signature: weights positional or not supported
         if weights is None:
             model = pb.models.DixonColesGoalModel(
                 results_df["goals_home"],
@@ -92,7 +89,7 @@ def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradi
     return model
 
 # -------------------------
-# FootballProbabilityGrid market helpers (version-safe)
+# Grid helpers
 # -------------------------
 def get_btts_probs(grid):
     if hasattr(grid, "btts_yes") and hasattr(grid, "btts_no"):
@@ -145,11 +142,7 @@ def win_to_nil_probs(grid):
     return p_home, p_away
 
 # -------------------------
-# EV calculation (per £1 stake)
-# Betfair commission reduces profit, not stake.
-# net_return = 1 + (odds-1)*(1-commission)
-# EV = p*net_return - 1
-# EV% = EV*100
+# EV calculation
 # -------------------------
 def ev_percent(p: float, betfair_odds: float, commission: float) -> float:
     p = safe_float(p)
@@ -162,14 +155,17 @@ def ev_percent(p: float, betfair_odds: float, commission: float) -> float:
     return 100.0 * ev
 
 # -------------------------
-# App header
+# App
 # -------------------------
 st.title("⚽ Dixon–Coles Forecasting (Penaltyblog)")
-st.caption("Upload results → fit Dixon–Coles → pick teams → get model odds → type Betfair odds → EV% & value.")
+st.caption("Fit the model, pick two teams, then enter Betfair odds to get EV% + value.")
 
-# -------------------------
-# Sidebar: model + markets + display
-# -------------------------
+# Initialise session state for forecast persistence
+if "last_forecast" not in st.session_state:
+    st.session_state["last_forecast"] = None  # will hold dict with key info + market_df
+if "bf_inputs" not in st.session_state:
+    st.session_state["bf_inputs"] = {}  # mapping (market, selection) -> odds
+
 with st.sidebar:
     st.subheader("Step 1 — Upload historical results")
     results_file = st.file_uploader("results.csv", type=["csv"], label_visibility="collapsed")
@@ -177,7 +173,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Model options")
     use_time_decay = st.checkbox("Use time-decay weighting (requires 'date')", value=True)
-    xi = st.slider("Decay factor (xi)", min_value=0.0, max_value=0.01, value=0.001, step=0.0005)
+    xi = st.slider("Decay factor (xi)", 0.0, 0.01, 0.001, 0.0005)
     use_gradient = st.checkbox("Use gradient optimisation (if supported)", value=True)
 
     st.divider()
@@ -209,9 +205,6 @@ with st.sidebar:
     prob_decimals = st.selectbox("Probability % decimals", [0, 1, 2], index=1)
     odds_decimals = st.selectbox("Odds decimals", [2, 3], index=0)
 
-# -------------------------
-# Tabs
-# -------------------------
 tab_fit, tab_forecast, tab_help = st.tabs(["1) Upload & Fit", "2) Forecast + Betfair EV", "Help"])
 
 # -------------------------
@@ -236,7 +229,6 @@ with tab_fit:
     results_df["team_home"] = results_df["team_home"].astype(str)
     results_df["team_away"] = results_df["team_away"].astype(str)
 
-    # Date handling
     date_ok = False
     if has_date_column(results_df):
         results_df["date"] = parse_date_series_dayfirst(results_df["date"])
@@ -246,11 +238,9 @@ with tab_fit:
     if use_time_decay and not date_ok:
         st.warning("Time-decay is enabled but no usable 'date' column was found. It will be ignored.")
 
-    # Date filter
     if date_ok:
         min_d = results_df["date"].min()
         max_d = results_df["date"].max()
-        st.markdown("### Training date range")
         d1, d2 = st.slider(
             "Filter historical matches used for fitting",
             min_value=min_d.to_pydatetime(),
@@ -266,7 +256,6 @@ with tab_fit:
 
     weights = None
     if use_time_decay and date_ok:
-        # weights helper expects dates series and xi
         weights = pb.models.dixon_coles_weights(train_df["date"], xi)
 
     with st.spinner("Fitting Dixon–Coles model..."):
@@ -277,16 +266,13 @@ with tab_fit:
             st.stop()
 
     st.success("Model fitted ✅")
+    st.session_state["clf"] = clf
+    st.session_state["teams"] = teams
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Matches used", f"{len(train_df):,}")
     c2.metric("Teams", f"{len(teams):,}")
     c3.metric("Time-decay", "On" if (use_time_decay and date_ok) else "Off")
-
-    with st.expander("Preview training data"):
-        st.dataframe(train_df.head(50), use_container_width=True)
-
-    st.session_state["clf"] = clf
-    st.session_state["teams"] = teams
 
 # -------------------------
 # Forecast + EV tab
@@ -306,137 +292,172 @@ with tab_forecast:
     with colB:
         away_team = st.selectbox("Away", teams, index=1 if len(teams) > 1 else 0)
     with colC:
-        run = st.button("Run", type="primary", use_container_width=True)
-
-    if not run:
-        st.stop()
+        run_clicked = st.button("Run", type="primary", use_container_width=True)
 
     if home_team == away_team:
         st.error("Home and Away cannot be the same team.")
         st.stop()
 
-    # Predict
-    try:
+    # Decide whether to use cached forecast or re-run
+    # Re-run if user clicked Run, or if no cached result, or if cached teams differ
+    cached = st.session_state["last_forecast"]
+    need_rerun = (
+        run_clicked
+        or cached is None
+        or cached.get("home") != home_team
+        or cached.get("away") != away_team
+        or cached.get("settings") != {
+            "include_1x2": include_1x2,
+            "include_double_chance": include_double_chance,
+            "include_dnb": include_dnb,
+            "include_ou": include_ou,
+            "ou_line": float(ou_line),
+            "include_btts": include_btts,
+            "include_ah": include_ah,
+            "ah_line": float(ah_line),
+            "include_exact_score": include_exact_score,
+            "top_n_scores": int(top_n_scores),
+            "include_win_to_nil": include_win_to_nil,
+        }
+    )
+
+    if need_rerun:
+        # Clear Betfair inputs when simulation settings change (optional but usually desired)
+        st.session_state["bf_inputs"] = {}
+
         try:
-            grid = clf.predict(home_team, away_team, max_goals=15, normalize=True)
-        except TypeError:
-            grid = clf.predict(home_team, away_team)
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-        st.stop()
+            try:
+                grid = clf.predict(home_team, away_team, max_goals=15, normalize=True)
+            except TypeError:
+                grid = clf.predict(home_team, away_team)
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
+            st.stop()
 
-    fixture_label = f"{home_team} vs {away_team}"
+        fixture_label = f"{home_team} vs {away_team}"
+        rows = []
 
-    # Build market table
-    rows = []
+        # 1X2
+        if include_1x2:
+            p_home, p_draw, p_away = grid.home_draw_away
+            for sel, p in [("Home", p_home), ("Draw", p_draw), ("Away", p_away)]:
+                p = safe_float(p)
+                rows.append([fixture_label, "1X2", sel, p, implied_decimal_odds(p)])
 
-    # 1X2
-    if include_1x2:
-        p_home, p_draw, p_away = grid.home_draw_away
-        for sel, p in [("Home", p_home), ("Draw", p_draw), ("Away", p_away)]:
-            p = safe_float(p)
-            rows.append([fixture_label, "1X2", sel, p, implied_decimal_odds(p)])
+        # Double Chance
+        if include_double_chance:
+            dc = get_double_chance(grid)
+            for sel, p in dc.items():
+                rows.append([fixture_label, "Double Chance", sel, p, implied_decimal_odds(p)])
 
-    # Double Chance
-    if include_double_chance:
-        dc = get_double_chance(grid)
-        for sel, p in dc.items():
-            rows.append([fixture_label, "Double Chance", sel, p, implied_decimal_odds(p)])
+        # DNB
+        if include_dnb:
+            dnb = get_dnb(grid)
+            for sel, p in dnb.items():
+                rows.append([fixture_label, "Draw No Bet", sel, p, implied_decimal_odds(p)])
 
-    # DNB
-    if include_dnb:
-        dnb = get_dnb(grid)
-        for sel, p in dnb.items():
-            rows.append([fixture_label, "Draw No Bet", sel, p, implied_decimal_odds(p)])
+        # Over/Under
+        if include_ou:
+            p_over = safe_float(grid.total_goals("over", float(ou_line)))
+            p_under = 1.0 - p_over
+            rows.append([fixture_label, f"Totals {ou_line}", f"Over {ou_line}", p_over, implied_decimal_odds(p_over)])
+            rows.append([fixture_label, f"Totals {ou_line}", f"Under {ou_line}", p_under, implied_decimal_odds(p_under)])
 
-    # Over/Under
-    if include_ou:
-        p_over = safe_float(grid.total_goals("over", float(ou_line)))
-        p_under = 1.0 - p_over
-        rows.append([fixture_label, f"Totals {ou_line}", f"Over {ou_line}", p_over, implied_decimal_odds(p_over)])
-        rows.append([fixture_label, f"Totals {ou_line}", f"Under {ou_line}", p_under, implied_decimal_odds(p_under)])
+        # BTTS
+        if include_btts:
+            p_yes, p_no = get_btts_probs(grid)
+            if not np.isnan(p_yes):
+                rows.append([fixture_label, "BTTS", "Yes", p_yes, implied_decimal_odds(p_yes)])
+            if not np.isnan(p_no):
+                rows.append([fixture_label, "BTTS", "No", p_no, implied_decimal_odds(p_no)])
 
-    # BTTS
-    if include_btts:
-        p_yes, p_no = get_btts_probs(grid)
-        if not np.isnan(p_yes):
-            rows.append([fixture_label, "BTTS", "Yes", p_yes, implied_decimal_odds(p_yes)])
-        if not np.isnan(p_no):
-            rows.append([fixture_label, "BTTS", "No", p_no, implied_decimal_odds(p_no)])
+        # Asian handicap
+        if include_ah:
+            p_ah_home = safe_float(grid.asian_handicap("home", float(ah_line)))
+            p_ah_away = 1.0 - p_ah_home
+            rows.append([fixture_label, f"AH {ah_line}", f"Home {float(ah_line):+}", p_ah_home, implied_decimal_odds(p_ah_home)])
+            rows.append([fixture_label, f"AH {ah_line}", f"Away {-float(ah_line):+}", p_ah_away, implied_decimal_odds(p_ah_away)])
 
-    # Asian handicap
-    if include_ah:
-        p_ah_home = safe_float(grid.asian_handicap("home", float(ah_line)))
-        p_ah_away = 1.0 - p_ah_home
-        rows.append([fixture_label, f"AH {ah_line}", f"Home {float(ah_line):+}", p_ah_home, implied_decimal_odds(p_ah_home)])
-        rows.append([fixture_label, f"AH {ah_line}", f"Away {-float(ah_line):+}", p_ah_away, implied_decimal_odds(p_ah_away)])
+        # Win to nil
+        if include_win_to_nil:
+            p_hwtn, p_awtn = win_to_nil_probs(grid)
+            if not np.isnan(p_hwtn):
+                rows.append([fixture_label, "Win to Nil", "Home Win to Nil", p_hwtn, implied_decimal_odds(p_hwtn)])
+            if not np.isnan(p_awtn):
+                rows.append([fixture_label, "Win to Nil", "Away Win to Nil", p_awtn, implied_decimal_odds(p_awtn)])
 
-    # Win to nil
-    if include_win_to_nil:
-        p_hwtn, p_awtn = win_to_nil_probs(grid)
-        if not np.isnan(p_hwtn):
-            rows.append([fixture_label, "Win to Nil", "Home Win to Nil", p_hwtn, implied_decimal_odds(p_hwtn)])
-        if not np.isnan(p_awtn):
-            rows.append([fixture_label, "Win to Nil", "Away Win to Nil", p_awtn, implied_decimal_odds(p_awtn)])
+        # Exact score Top N
+        if include_exact_score and hasattr(grid, "exact_score"):
+            candidates = []
+            max_goals = 8
+            for hg in range(0, max_goals + 1):
+                for ag in range(0, max_goals + 1):
+                    p = exact_score_prob(grid, hg, ag)
+                    if not np.isnan(p) and p > 0:
+                        candidates.append((hg, ag, p))
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            for hg, ag, p in candidates[: int(top_n_scores)]:
+                rows.append([fixture_label, "Correct Score", f"{hg}-{ag}", p, implied_decimal_odds(p)])
 
-    # Exact score Top N
-    if include_exact_score and hasattr(grid, "exact_score"):
-        candidates = []
-        max_goals = 8
-        for hg in range(0, max_goals + 1):
-            for ag in range(0, max_goals + 1):
-                p = exact_score_prob(grid, hg, ag)
-                if not np.isnan(p) and p > 0:
-                    candidates.append((hg, ag, p))
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        for hg, ag, p in candidates[: int(top_n_scores)]:
-            rows.append([fixture_label, "Correct Score", f"{hg}-{ag}", p, implied_decimal_odds(p)])
+        market_df = pd.DataFrame(rows, columns=["fixture", "market", "selection", "model_prob", "model_odds"])
 
-    market_df = pd.DataFrame(rows, columns=["fixture", "market", "selection", "model_prob", "model_odds"])
+        st.session_state["last_forecast"] = {
+            "home": home_team,
+            "away": away_team,
+            "settings": {
+                "include_1x2": include_1x2,
+                "include_double_chance": include_double_chance,
+                "include_dnb": include_dnb,
+                "include_ou": include_ou,
+                "ou_line": float(ou_line),
+                "include_btts": include_btts,
+                "include_ah": include_ah,
+                "ah_line": float(ah_line),
+                "include_exact_score": include_exact_score,
+                "top_n_scores": int(top_n_scores),
+                "include_win_to_nil": include_win_to_nil,
+            },
+            "market_df": market_df,
+        }
 
-    # Prepare editable Betfair odds table
-    editor_df = market_df.copy()
-    editor_df["betfair_odds"] = np.nan
-
-    # If we already have previous edits for same fixture, reuse them
-    key = f"bf_odds_{fixture_label}"
-    if key in st.session_state:
-        prev = st.session_state[key]
-        # merge on market+selection
-        editor_df = editor_df.merge(
-            prev[["market", "selection", "betfair_odds"]],
-            on=["market", "selection"],
-            how="left",
-            suffixes=("", "_prev"),
-        )
-        editor_df["betfair_odds"] = editor_df["betfair_odds_prev"].combine_first(editor_df["betfair_odds"])
-        editor_df = editor_df.drop(columns=["betfair_odds_prev"])
+    # From here on, ALWAYS render the editor using cached results
+    cached = st.session_state["last_forecast"]
+    market_df = cached["market_df"].copy()
 
     st.markdown("### Model outputs + enter Betfair odds")
-    st.caption("Type Betfair decimal odds into the last column. EV% accounts for commission on winnings.")
+    st.caption("Edits rerun the app, but your latest simulation stays on screen.")
+
+    # Add betfair odds column from session (persist across reruns)
+    def get_bf(mkt, sel):
+        return st.session_state["bf_inputs"].get((mkt, sel), np.nan)
+
+    editor_df = market_df.copy()
+    editor_df["betfair_odds"] = editor_df.apply(lambda r: get_bf(r["market"], r["selection"]), axis=1)
 
     edited = st.data_editor(
         editor_df,
         use_container_width=True,
         hide_index=True,
+        disabled=["fixture", "market", "selection", "model_prob", "model_odds"],
         column_config={
             "model_prob": st.column_config.NumberColumn("Model prob", format="%.6f", disabled=True),
             "model_odds": st.column_config.NumberColumn("Model odds (fair)", format="%.3f", disabled=True),
             "betfair_odds": st.column_config.NumberColumn("Betfair odds", format="%.3f"),
         },
-        disabled=["fixture", "market", "selection"],
-        key=f"editor_{fixture_label}",
+        key="bf_editor",
     )
 
-    # Store odds edits in session
-    st.session_state[key] = edited[["market", "selection", "betfair_odds"]].copy()
+    # Persist any new edits back into session_state
+    new_map = {}
+    for _, r in edited.iterrows():
+        new_map[(r["market"], r["selection"])] = safe_float(r["betfair_odds"])
+    st.session_state["bf_inputs"] = new_map
 
     # Compute EV + value
     out = edited.copy()
     out["EV_%"] = out.apply(lambda r: ev_percent(r["model_prob"], r["betfair_odds"], commission), axis=1)
-    out["Value"] = out["EV_%"].apply(lambda x: (not np.isnan(x)) and (x > 0.0))
+    out["Value"] = out["EV_%"].apply(lambda x: (not np.isnan(safe_float(x))) and (safe_float(x) > 0.0))
 
-    # Pretty display
     pretty = out.copy()
     pretty["model_prob"] = pretty["model_prob"].apply(lambda x: fmt_prob(x, prob_decimals))
     pretty["model_odds"] = pretty["model_odds"].apply(lambda x: fmt_odds(x, odds_decimals))
@@ -447,13 +468,13 @@ with tab_forecast:
         pretty = pretty[pretty["Value"] == True]
 
     st.markdown("### Value view")
-    st.dataframe(pretty[["fixture", "market", "selection", "model_prob", "model_odds", "betfair_odds", "EV_%", "Value"]], use_container_width=True)
+    st.dataframe(
+        pretty[["fixture", "market", "selection", "model_prob", "model_odds", "betfair_odds", "EV_%", "Value"]],
+        use_container_width=True
+    )
 
-    # Quick summary
-    n_value = int(out["Value"].sum())
-    st.metric("Value selections", n_value)
+    st.metric("Value selections", int(out["Value"].sum()))
 
-    # Downloads
     st.download_button(
         "Download full table (with Betfair odds + EV)",
         data=out.to_csv(index=False).encode("utf-8"),
@@ -465,13 +486,10 @@ with tab_forecast:
 # Help tab
 # -------------------------
 with tab_help:
-    st.markdown("### CSV formats")
-    st.markdown("**results.csv required columns**")
+    st.markdown("### results.csv columns")
     st.code("team_home, team_away, goals_home, goals_away", language="text")
     st.markdown("Optional (recommended):")
     st.code("date  (your format: 17/08/2024)", language="text")
-    st.markdown("**fixtures.csv required columns** (only used if you later add batch mode again)")
-    st.code("team_home, team_away", language="text")
 
     st.markdown("### EV% definition")
     st.markdown(
