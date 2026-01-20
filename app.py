@@ -1,5 +1,4 @@
 import io
-from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -7,40 +6,36 @@ import penaltyblog as pb
 
 st.set_page_config(page_title="Dixon–Coles Forecasting", layout="wide")
 
-# -------------------------
-# Required columns
-# -------------------------
 REQUIRED_RESULTS_COLS = {"team_home", "team_away", "goals_home", "goals_away"}
 REQUIRED_FIXTURE_COLS = {"team_home", "team_away"}
 
 # -------------------------
-# Formatting helpers
+# Helpers
 # -------------------------
-def implied_decimal_odds(p: float) -> float:
-    p = float(p)
-    if p <= 0:
-        return float("inf")
-    return 1.0 / p
-
 def safe_float(x):
     try:
         return float(x)
     except Exception:
         return np.nan
 
+def implied_decimal_odds(p: float) -> float:
+    p = safe_float(p)
+    if np.isnan(p) or p <= 0:
+        return float("inf")
+    return 1.0 / p
+
 def fmt_prob(p: float, decimals: int = 1) -> str:
-    if p is None or (isinstance(p, float) and np.isnan(p)):
+    p = safe_float(p)
+    if np.isnan(p):
         return ""
-    return f"{100.0 * float(p):.{decimals}f}%"
+    return f"{100.0 * p:.{decimals}f}%"
 
 def fmt_odds(o: float, decimals: int = 2) -> str:
-    if o is None or o == float("inf") or (isinstance(o, float) and np.isnan(o)):
+    o = safe_float(o)
+    if np.isnan(o) or o == float("inf"):
         return ""
-    return f"{float(o):.{decimals}f}"
+    return f"{o:.{decimals}f}"
 
-# -------------------------
-# Data helpers
-# -------------------------
 def validate_columns(df: pd.DataFrame, required: set, name: str):
     missing = required - set(df.columns)
     if missing:
@@ -51,22 +46,18 @@ def read_csv(uploaded_file) -> pd.DataFrame:
     content = uploaded_file.getvalue()
     return pd.read_csv(io.BytesIO(content))
 
-def parse_date_series(s: pd.Series) -> pd.Series:
-    # Handle common date formats; results become pandas datetime
-    return pd.to_datetime(s, errors="coerce", utc=False)
+def parse_date_series_dayfirst(s: pd.Series) -> pd.Series:
+    # Your format is 17/08/2024 => dayfirst=True
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
 def has_date_column(df: pd.DataFrame) -> bool:
     return "date" in df.columns
 
 # -------------------------
-# penaltyblog model fitting (supports weights)
+# penaltyblog model fitting (supports weights in newer versions)
 # -------------------------
 @st.cache_resource(show_spinner=True)
 def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradient: bool):
-    """
-    Fits a Dixon–Coles model. Uses keyword 'weights' when possible (newer versions),
-    otherwise falls back to positional (older versions).
-    """
     try:
         model = pb.models.DixonColesGoalModel(
             results_df["goals_home"],
@@ -76,7 +67,7 @@ def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradi
             weights=weights,
         )
     except TypeError:
-        # Older signature used positional weights
+        # Older signature: weights positional or not supported
         if weights is None:
             model = pb.models.DixonColesGoalModel(
                 results_df["goals_home"],
@@ -93,7 +84,6 @@ def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradi
                 weights,
             )
 
-    # Fit options (newer penaltyblog supports use_gradient/minimizer_options, but keep safe)
     try:
         model.fit(use_gradient=use_gradient)
     except TypeError:
@@ -105,112 +95,93 @@ def fit_dc_model(results_df: pd.DataFrame, weights: np.ndarray | None, use_gradi
 # FootballProbabilityGrid market helpers (version-safe)
 # -------------------------
 def get_btts_probs(grid):
-    # Newer grid: btts_yes/btts_no; docs also show both_teams_to_score in some contexts :contentReference[oaicite:2]{index=2}
     if hasattr(grid, "btts_yes") and hasattr(grid, "btts_no"):
         return safe_float(grid.btts_yes), safe_float(grid.btts_no)
     if hasattr(grid, "both_teams_to_score"):
         p_yes = safe_float(grid.both_teams_to_score)
         return p_yes, 1.0 - p_yes
-    if hasattr(grid, "btts"):
-        val = grid.btts
-        if callable(val):
-            p_yes = safe_float(val("yes"))
-            return p_yes, 1.0 - p_yes
-    raise AttributeError("BTTS not available on this FootballProbabilityGrid.")
+    if hasattr(grid, "btts") and callable(grid.btts):
+        p_yes = safe_float(grid.btts("yes"))
+        return p_yes, 1.0 - p_yes
+    return np.nan, np.nan
 
 def get_double_chance(grid):
-    # From penaltyblog v1.5.0 example :contentReference[oaicite:3]{index=3}
     out = {}
-    if hasattr(grid, "double_chance_1x"):
-        out["1X"] = safe_float(grid.double_chance_1x)
-    if hasattr(grid, "double_chance_x2"):
-        out["X2"] = safe_float(grid.double_chance_x2)
-    if hasattr(grid, "double_chance_12"):
-        out["12"] = safe_float(grid.double_chance_12)
+    if hasattr(grid, "double_chance_1x"): out["1X"] = safe_float(grid.double_chance_1x)
+    if hasattr(grid, "double_chance_x2"): out["X2"] = safe_float(grid.double_chance_x2)
+    if hasattr(grid, "double_chance_12"): out["12"] = safe_float(grid.double_chance_12)
     return out
 
 def get_dnb(grid):
-    # From penaltyblog v1.5.0 example :contentReference[oaicite:4]{index=4}
     out = {}
-    if hasattr(grid, "draw_no_bet_home"):
-        out["Home DNB"] = safe_float(grid.draw_no_bet_home)
-    if hasattr(grid, "draw_no_bet_away"):
-        out["Away DNB"] = safe_float(grid.draw_no_bet_away)
+    if hasattr(grid, "draw_no_bet_home"): out["Home DNB"] = safe_float(grid.draw_no_bet_home)
+    if hasattr(grid, "draw_no_bet_away"): out["Away DNB"] = safe_float(grid.draw_no_bet_away)
     return out
 
 def exact_score_prob(grid, hg: int, ag: int) -> float:
-    # From penaltyblog v1.5.0 example :contentReference[oaicite:5]{index=5}
     if hasattr(grid, "exact_score"):
         return safe_float(grid.exact_score(hg, ag))
-    # If not available, we can't reliably compute without the matrix API.
     return np.nan
 
-def goal_distributions(grid):
-    # From penaltyblog v1.5.0 example :contentReference[oaicite:6]{index=6}
-    out = {}
-    if hasattr(grid, "home_goal_distribution"):
-        out["home"] = np.array(grid.home_goal_distribution(), dtype=float)
-    if hasattr(grid, "away_goal_distribution"):
-        out["away"] = np.array(grid.away_goal_distribution(), dtype=float)
-    if hasattr(grid, "total_goals_distribution"):
-        out["total"] = np.array(grid.total_goals_distribution(), dtype=float)
-    return out
-
 def win_to_nil_probs(grid):
-    """
-    Win to Nil:
-      - Home win & away scores 0
-      - Away win & home scores 0
-    We compute using exact scores if available, otherwise return NaN.
-    """
-    max_goals = 10
-    p_home_wtn = 0.0
-    p_away_wtn = 0.0
-    any_valid = False
-
-    if hasattr(grid, "exact_score"):
-        for hg in range(1, max_goals + 1):
-            p = exact_score_prob(grid, hg, 0)
-            if not np.isnan(p):
-                p_home_wtn += p
-                any_valid = True
-        for ag in range(1, max_goals + 1):
-            p = exact_score_prob(grid, 0, ag)
-            if not np.isnan(p):
-                p_away_wtn += p
-                any_valid = True
-
-    if not any_valid:
+    if not hasattr(grid, "exact_score"):
         return np.nan, np.nan
+    max_goals = 10
+    p_home = 0.0
+    p_away = 0.0
+    ok = False
+    for hg in range(1, max_goals + 1):
+        p = exact_score_prob(grid, hg, 0)
+        if not np.isnan(p):
+            p_home += p
+            ok = True
+    for ag in range(1, max_goals + 1):
+        p = exact_score_prob(grid, 0, ag)
+        if not np.isnan(p):
+            p_away += p
+            ok = True
+    if not ok:
+        return np.nan, np.nan
+    return p_home, p_away
 
-    return p_home_wtn, p_away_wtn
+# -------------------------
+# EV calculation (per £1 stake)
+# Betfair commission reduces profit, not stake.
+# net_return = 1 + (odds-1)*(1-commission)
+# EV = p*net_return - 1
+# EV% = EV*100
+# -------------------------
+def ev_percent(p: float, betfair_odds: float, commission: float) -> float:
+    p = safe_float(p)
+    o = safe_float(betfair_odds)
+    c = safe_float(commission)
+    if np.isnan(p) or np.isnan(o) or o <= 1 or p <= 0 or p >= 1 or c < 0 or c >= 1:
+        return np.nan
+    net_return = 1.0 + (o - 1.0) * (1.0 - c)
+    ev = p * net_return - 1.0
+    return 100.0 * ev
 
 # -------------------------
 # App header
 # -------------------------
 st.title("⚽ Dixon–Coles Forecasting (Penaltyblog)")
-st.caption(
-    "Upload historical results, optionally apply time-decay, then forecast markets with a clean betting-style output."
-)
+st.caption("Upload results → fit Dixon–Coles → pick teams → get model odds → type Betfair odds → EV% & value.")
 
 # -------------------------
-# Sidebar: Inputs
+# Sidebar: model + markets + display
 # -------------------------
 with st.sidebar:
     st.subheader("Step 1 — Upload historical results")
     results_file = st.file_uploader("results.csv", type=["csv"], label_visibility="collapsed")
 
     st.divider()
-    st.subheader("Step 2 — Model options")
-
-    use_time_decay = st.checkbox("Use time-decay weighting (requires a 'date' column)", value=True)
-    xi = st.slider("Decay factor (xi)", min_value=0.0, max_value=0.01, value=0.001, step=0.0005,
-                   help="Higher xi down-weights older matches more strongly.")
+    st.subheader("Model options")
+    use_time_decay = st.checkbox("Use time-decay weighting (requires 'date')", value=True)
+    xi = st.slider("Decay factor (xi)", min_value=0.0, max_value=0.01, value=0.001, step=0.0005)
     use_gradient = st.checkbox("Use gradient optimisation (if supported)", value=True)
 
     st.divider()
-    st.subheader("Step 3 — Markets")
-
+    st.subheader("Markets")
     include_1x2 = st.checkbox("1X2", value=True)
     include_double_chance = st.checkbox("Double Chance (1X / X2 / 12)", value=True)
     include_dnb = st.checkbox("Draw No Bet (Home/Away)", value=True)
@@ -226,29 +197,31 @@ with st.sidebar:
     include_exact_score = st.checkbox("Exact Score (Top N)", value=True)
     top_n_scores = st.slider("Top N scorelines", 5, 30, 10, disabled=not include_exact_score)
 
-    include_distributions = st.checkbox("Goal distributions (Home/Away/Total)", value=False)
     include_win_to_nil = st.checkbox("Win to Nil (Home/Away)", value=True)
+
+    st.divider()
+    st.subheader("Betfair EV")
+    commission = st.slider("Betfair commission", 0.0, 0.20, 0.05, 0.01)
+    show_value_only = st.checkbox("Show value only", value=False)
 
     st.divider()
     st.subheader("Display")
     prob_decimals = st.selectbox("Probability % decimals", [0, 1, 2], index=1)
     odds_decimals = st.selectbox("Odds decimals", [2, 3], index=0)
-    show_wide_table = st.checkbox("Also show wide table", value=False)
 
 # -------------------------
 # Tabs
 # -------------------------
-tab_fit, tab_forecast, tab_help = st.tabs(["1) Upload & Fit", "2) Forecast", "Help"])
+tab_fit, tab_forecast, tab_help = st.tabs(["1) Upload & Fit", "2) Forecast + Betfair EV", "Help"])
 
 # -------------------------
-# Tab: Upload & Fit
+# Fit tab
 # -------------------------
 with tab_fit:
     if not results_file:
         st.info("Upload **results.csv** from the sidebar to begin.")
         st.stop()
 
-    # Read and validate
     try:
         results_df = read_csv(results_file)
         validate_columns(results_df, REQUIRED_RESULTS_COLS, "results.csv")
@@ -256,7 +229,6 @@ with tab_fit:
         st.error(f"Could not read results.csv: {e}")
         st.stop()
 
-    # Coerce goals + clean
     for c in ["goals_home", "goals_away"]:
         results_df[c] = pd.to_numeric(results_df[c], errors="coerce")
 
@@ -264,17 +236,17 @@ with tab_fit:
     results_df["team_home"] = results_df["team_home"].astype(str)
     results_df["team_away"] = results_df["team_away"].astype(str)
 
-    # Date handling + filter
+    # Date handling
     date_ok = False
     if has_date_column(results_df):
-        results_df["date"] = parse_date_series(results_df["date"])
+        results_df["date"] = parse_date_series_dayfirst(results_df["date"])
         if results_df["date"].notna().any():
             date_ok = True
 
     if use_time_decay and not date_ok:
-        st.warning("Time-decay is enabled but your results.csv has no usable 'date' column. Time-decay will be ignored.")
+        st.warning("Time-decay is enabled but no usable 'date' column was found. It will be ignored.")
 
-    # If date exists, allow filtering the training window
+    # Date filter
     if date_ok:
         min_d = results_df["date"].min()
         max_d = results_df["date"].max()
@@ -286,46 +258,38 @@ with tab_fit:
             value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
         )
         mask = (results_df["date"] >= pd.Timestamp(d1)) & (results_df["date"] <= pd.Timestamp(d2))
-        filtered_df = results_df.loc[mask].copy()
+        train_df = results_df.loc[mask].copy()
     else:
-        filtered_df = results_df
+        train_df = results_df
 
-    teams = sorted(set(filtered_df["team_home"]).union(set(filtered_df["team_away"])))
+    teams = sorted(set(train_df["team_home"]).union(set(train_df["team_away"])))
 
-    # Build weights if possible and requested
     weights = None
     if use_time_decay and date_ok:
-        # penaltyblog provides pb.models.dixon_coles_weights(date, xi) :contentReference[oaicite:7]{index=7}
-        weights = pb.models.dixon_coles_weights(filtered_df["date"], xi)
+        # weights helper expects dates series and xi
+        weights = pb.models.dixon_coles_weights(train_df["date"], xi)
 
-    # Fit model
     with st.spinner("Fitting Dixon–Coles model..."):
         try:
-            clf = fit_dc_model(filtered_df, weights=weights, use_gradient=use_gradient)
+            clf = fit_dc_model(train_df, weights=weights, use_gradient=use_gradient)
         except Exception as e:
             st.error(f"Model fit failed: {e}")
             st.stop()
 
     st.success("Model fitted ✅")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Matches used", f"{len(filtered_df):,}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Matches used", f"{len(train_df):,}")
     c2.metric("Teams", f"{len(teams):,}")
     c3.metric("Time-decay", "On" if (use_time_decay and date_ok) else "Off")
-    c4.metric("xi", f"{xi:.4f}" if (use_time_decay and date_ok) else "—")
 
     with st.expander("Preview training data"):
-        st.dataframe(filtered_df.head(50), use_container_width=True)
+        st.dataframe(train_df.head(50), use_container_width=True)
 
-    with st.expander("Team list"):
-        st.write(teams)
-
-    # Save to session for Forecast tab
     st.session_state["clf"] = clf
     st.session_state["teams"] = teams
 
 # -------------------------
-# Tab: Forecast
+# Forecast + EV tab
 # -------------------------
 with tab_forecast:
     if "clf" not in st.session_state:
@@ -335,248 +299,187 @@ with tab_forecast:
     clf = st.session_state["clf"]
     teams = st.session_state["teams"]
 
-    st.markdown("### Step A — Provide fixtures")
-    mode = st.radio("Choose input method", ["Upload fixtures.csv", "Build fixtures here"], horizontal=True)
+    st.markdown("### Pick teams")
+    colA, colB, colC = st.columns([4, 4, 2])
+    with colA:
+        home_team = st.selectbox("Home", teams, index=0)
+    with colB:
+        away_team = st.selectbox("Away", teams, index=1 if len(teams) > 1 else 0)
+    with colC:
+        run = st.button("Run", type="primary", use_container_width=True)
 
-    fixtures_df = None
-
-    if mode == "Upload fixtures.csv":
-        fixtures_file = st.file_uploader("fixtures.csv", type=["csv"])
-        if not fixtures_file:
-            st.info("Upload **fixtures.csv** (columns: team_home, team_away), or switch to 'Build fixtures here'.")
-            st.stop()
-        try:
-            fixtures_df = read_csv(fixtures_file)
-            validate_columns(fixtures_df, REQUIRED_FIXTURE_COLS, "fixtures.csv")
-        except Exception as e:
-            st.error(f"Could not read fixtures.csv: {e}")
-            st.stop()
-        fixtures_df["team_home"] = fixtures_df["team_home"].astype(str)
-        fixtures_df["team_away"] = fixtures_df["team_away"].astype(str)
-
-    else:
-        # Manual builder stored in session
-        if "fixture_rows" not in st.session_state:
-            st.session_state["fixture_rows"] = []
-
-        col1, col2, col3 = st.columns([4, 4, 2])
-        with col1:
-            home_sel = st.selectbox("Home team", teams, index=0)
-        with col2:
-            away_sel = st.selectbox("Away team", teams, index=1 if len(teams) > 1 else 0)
-        with col3:
-            if st.button("Add", use_container_width=True):
-                if home_sel == away_sel:
-                    st.warning("Home and Away cannot be the same.")
-                else:
-                    st.session_state["fixture_rows"].append({"team_home": home_sel, "team_away": away_sel})
-
-        if st.session_state["fixture_rows"]:
-            st.dataframe(pd.DataFrame(st.session_state["fixture_rows"]), use_container_width=True)
-            if st.button("Clear fixtures"):
-                st.session_state["fixture_rows"] = []
-        else:
-            st.info("Add at least one fixture using the dropdowns above.")
-
-        if not st.session_state["fixture_rows"]:
-            st.stop()
-
-        fixtures_df = pd.DataFrame(st.session_state["fixture_rows"])
-
-    # Warn about unknown teams (name mismatch)
-    unknown = sorted(set(
-        [t for t in fixtures_df["team_home"].tolist() + fixtures_df["team_away"].tolist() if t not in teams]
-    ))
-    if unknown:
-        st.warning("These teams are not in training data (likely a naming mismatch): " + ", ".join(unknown))
-
-    st.markdown("### Step B — Forecast")
-
-    run = st.button("Run forecast", type="primary")
     if not run:
         st.stop()
 
-    # Build "betting-like" output rows:
-    market_rows = []
-    wide_rows = []
+    if home_team == away_team:
+        st.error("Home and Away cannot be the same team.")
+        st.stop()
 
-    progress = st.progress(0, text="Forecasting...")
-    n = len(fixtures_df)
-
-    for i, r in fixtures_df.iterrows():
-        home, away = r["team_home"], r["team_away"]
-
+    # Predict
+    try:
         try:
-            # Use normalize=True by default in newer penaltyblog; keep signature safe
-            try:
-                grid = clf.predict(home, away, max_goals=15, normalize=True)
-            except TypeError:
-                grid = clf.predict(home, away)
+            grid = clf.predict(home_team, away_team, max_goals=15, normalize=True)
+        except TypeError:
+            grid = clf.predict(home_team, away_team)
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+        st.stop()
 
-            fixture_label = f"{home} vs {away}"
+    fixture_label = f"{home_team} vs {away_team}"
 
-            # --- 1X2 ---
-            if include_1x2:
-                p_home, p_draw, p_away = grid.home_draw_away
-                for sel, p in [("Home", p_home), ("Draw", p_draw), ("Away", p_away)]:
-                    p = safe_float(p)
-                    market_rows.append([fixture_label, "1X2", sel, p, implied_decimal_odds(p)])
-                wide = {
-                    "fixture": fixture_label,
-                    "p_home": safe_float(p_home),
-                    "p_draw": safe_float(p_draw),
-                    "p_away": safe_float(p_away),
-                }
-            else:
-                wide = {"fixture": fixture_label}
+    # Build market table
+    rows = []
 
-            # --- Double chance ---
-            if include_double_chance:
-                dc = get_double_chance(grid)
-                for sel, p in dc.items():
-                    market_rows.append([fixture_label, "Double Chance", sel, p, implied_decimal_odds(p)])
-                wide.update({f"p_dc_{k.lower()}": v for k, v in dc.items()})
+    # 1X2
+    if include_1x2:
+        p_home, p_draw, p_away = grid.home_draw_away
+        for sel, p in [("Home", p_home), ("Draw", p_draw), ("Away", p_away)]:
+            p = safe_float(p)
+            rows.append([fixture_label, "1X2", sel, p, implied_decimal_odds(p)])
 
-            # --- Draw No Bet ---
-            if include_dnb:
-                dnb = get_dnb(grid)
-                for sel, p in dnb.items():
-                    market_rows.append([fixture_label, "Draw No Bet", sel, p, implied_decimal_odds(p)])
-                wide.update({f"p_{k.lower().replace(' ', '_')}": v for k, v in dnb.items()})
+    # Double Chance
+    if include_double_chance:
+        dc = get_double_chance(grid)
+        for sel, p in dc.items():
+            rows.append([fixture_label, "Double Chance", sel, p, implied_decimal_odds(p)])
 
-            # --- Over/Under ---
-            if include_ou:
-                p_over = safe_float(grid.total_goals("over", float(ou_line)))
-                p_under = 1.0 - p_over
-                market_rows.append([fixture_label, f"Totals {ou_line}", f"Over {ou_line}", p_over, implied_decimal_odds(p_over)])
-                market_rows.append([fixture_label, f"Totals {ou_line}", f"Under {ou_line}", p_under, implied_decimal_odds(p_under)])
-                wide.update({f"p_over_{ou_line}": p_over, f"p_under_{ou_line}": p_under})
+    # DNB
+    if include_dnb:
+        dnb = get_dnb(grid)
+        for sel, p in dnb.items():
+            rows.append([fixture_label, "Draw No Bet", sel, p, implied_decimal_odds(p)])
 
-                # If totals() exists, include push-aware info for integer lines
-                if hasattr(grid, "totals"):
-                    try:
-                        u, push, o = grid.totals(float(ou_line))
-                        wide.update({f"p_totals_under_{ou_line}": safe_float(u), f"p_totals_push_{ou_line}": safe_float(push), f"p_totals_over_{ou_line}": safe_float(o)})
-                    except Exception:
-                        pass
+    # Over/Under
+    if include_ou:
+        p_over = safe_float(grid.total_goals("over", float(ou_line)))
+        p_under = 1.0 - p_over
+        rows.append([fixture_label, f"Totals {ou_line}", f"Over {ou_line}", p_over, implied_decimal_odds(p_over)])
+        rows.append([fixture_label, f"Totals {ou_line}", f"Under {ou_line}", p_under, implied_decimal_odds(p_under)])
 
-            # --- BTTS ---
-            if include_btts:
-                p_yes, p_no = get_btts_probs(grid)
-                market_rows.append([fixture_label, "BTTS", "Yes", p_yes, implied_decimal_odds(p_yes)])
-                market_rows.append([fixture_label, "BTTS", "No", p_no, implied_decimal_odds(p_no)])
-                wide.update({"p_btts_yes": p_yes, "p_btts_no": p_no})
+    # BTTS
+    if include_btts:
+        p_yes, p_no = get_btts_probs(grid)
+        if not np.isnan(p_yes):
+            rows.append([fixture_label, "BTTS", "Yes", p_yes, implied_decimal_odds(p_yes)])
+        if not np.isnan(p_no):
+            rows.append([fixture_label, "BTTS", "No", p_no, implied_decimal_odds(p_no)])
 
-            # --- Asian handicap ---
-            if include_ah:
-                p_ah_home = safe_float(grid.asian_handicap("home", float(ah_line)))
-                p_ah_away = 1.0 - p_ah_home
-                market_rows.append([fixture_label, f"AH {ah_line}", f"Home {ah_line:+}", p_ah_home, implied_decimal_odds(p_ah_home)])
-                market_rows.append([fixture_label, f"AH {ah_line}", f"Away {-float(ah_line):+}", p_ah_away, implied_decimal_odds(p_ah_away)])
-                wide.update({f"p_ah_home_{ah_line}": p_ah_home, f"p_ah_away_{ah_line}": p_ah_away})
+    # Asian handicap
+    if include_ah:
+        p_ah_home = safe_float(grid.asian_handicap("home", float(ah_line)))
+        p_ah_away = 1.0 - p_ah_home
+        rows.append([fixture_label, f"AH {ah_line}", f"Home {float(ah_line):+}", p_ah_home, implied_decimal_odds(p_ah_home)])
+        rows.append([fixture_label, f"AH {ah_line}", f"Away {-float(ah_line):+}", p_ah_away, implied_decimal_odds(p_ah_away)])
 
-                # Push-aware breakdown if available (asian_handicap_probs)
-                if hasattr(grid, "asian_handicap_probs"):
-                    try:
-                        w, push, l = grid.asian_handicap_probs("home", float(ah_line))
-                        wide.update({f"p_ah_home_win_{ah_line}": safe_float(w),
-                                     f"p_ah_home_push_{ah_line}": safe_float(push),
-                                     f"p_ah_home_lose_{ah_line}": safe_float(l)})
-                    except Exception:
-                        pass
+    # Win to nil
+    if include_win_to_nil:
+        p_hwtn, p_awtn = win_to_nil_probs(grid)
+        if not np.isnan(p_hwtn):
+            rows.append([fixture_label, "Win to Nil", "Home Win to Nil", p_hwtn, implied_decimal_odds(p_hwtn)])
+        if not np.isnan(p_awtn):
+            rows.append([fixture_label, "Win to Nil", "Away Win to Nil", p_awtn, implied_decimal_odds(p_awtn)])
 
-            # --- Win to Nil ---
-            if include_win_to_nil:
-                p_home_wtn, p_away_wtn = win_to_nil_probs(grid)
-                if not np.isnan(p_home_wtn):
-                    market_rows.append([fixture_label, "Win to Nil", "Home Win to Nil", p_home_wtn, implied_decimal_odds(p_home_wtn)])
-                if not np.isnan(p_away_wtn):
-                    market_rows.append([fixture_label, "Win to Nil", "Away Win to Nil", p_away_wtn, implied_decimal_odds(p_away_wtn)])
-                wide.update({"p_home_win_to_nil": p_home_wtn, "p_away_win_to_nil": p_away_wtn})
+    # Exact score Top N
+    if include_exact_score and hasattr(grid, "exact_score"):
+        candidates = []
+        max_goals = 8
+        for hg in range(0, max_goals + 1):
+            for ag in range(0, max_goals + 1):
+                p = exact_score_prob(grid, hg, ag)
+                if not np.isnan(p) and p > 0:
+                    candidates.append((hg, ag, p))
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        for hg, ag, p in candidates[: int(top_n_scores)]:
+            rows.append([fixture_label, "Correct Score", f"{hg}-{ag}", p, implied_decimal_odds(p)])
 
-            # --- Exact score Top N ---
-            if include_exact_score and hasattr(grid, "exact_score"):
-                # enumerate a reasonable grid of scorelines, then take top N
-                candidates = []
-                max_goals = 8
-                for hg in range(0, max_goals + 1):
-                    for ag in range(0, max_goals + 1):
-                        p = exact_score_prob(grid, hg, ag)
-                        if not np.isnan(p) and p > 0:
-                            candidates.append((hg, ag, p))
-                candidates.sort(key=lambda x: x[2], reverse=True)
-                top = candidates[: int(top_n_scores)]
-                for hg, ag, p in top:
-                    market_rows.append([fixture_label, "Correct Score", f"{hg}-{ag}", p, implied_decimal_odds(p)])
+    market_df = pd.DataFrame(rows, columns=["fixture", "market", "selection", "model_prob", "model_odds"])
 
-            # --- Distributions ---
-            if include_distributions:
-                dists = goal_distributions(grid)
-                # Just store a few headline distribution values in wide output (optional)
-                if "total" in dists and len(dists["total"]) > 0:
-                    # e.g., P(Total Goals = 0..5)
-                    for k in range(min(6, len(dists["total"]))):
-                        wide[f"p_total_goals_eq_{k}"] = safe_float(dists["total"][k])
+    # Prepare editable Betfair odds table
+    editor_df = market_df.copy()
+    editor_df["betfair_odds"] = np.nan
 
-            wide_rows.append(wide)
+    # If we already have previous edits for same fixture, reuse them
+    key = f"bf_odds_{fixture_label}"
+    if key in st.session_state:
+        prev = st.session_state[key]
+        # merge on market+selection
+        editor_df = editor_df.merge(
+            prev[["market", "selection", "betfair_odds"]],
+            on=["market", "selection"],
+            how="left",
+            suffixes=("", "_prev"),
+        )
+        editor_df["betfair_odds"] = editor_df["betfair_odds_prev"].combine_first(editor_df["betfair_odds"])
+        editor_df = editor_df.drop(columns=["betfair_odds_prev"])
 
-        except Exception as e:
-            market_rows.append([f"{home} vs {away}", "ERROR", str(e), np.nan, np.nan])
+    st.markdown("### Model outputs + enter Betfair odds")
+    st.caption("Type Betfair decimal odds into the last column. EV% accounts for commission on winnings.")
 
-        progress.progress(int(100 * (i + 1) / max(n, 1)), text=f"Forecasting {i+1}/{n}")
+    edited = st.data_editor(
+        editor_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "model_prob": st.column_config.NumberColumn("Model prob", format="%.6f", disabled=True),
+            "model_odds": st.column_config.NumberColumn("Model odds (fair)", format="%.3f", disabled=True),
+            "betfair_odds": st.column_config.NumberColumn("Betfair odds", format="%.3f"),
+        },
+        disabled=["fixture", "market", "selection"],
+        key=f"editor_{fixture_label}",
+    )
 
-    progress.empty()
+    # Store odds edits in session
+    st.session_state[key] = edited[["market", "selection", "betfair_odds"]].copy()
 
-    # Build dataframes
-    market_df = pd.DataFrame(market_rows, columns=["fixture", "market", "selection", "prob", "odds"])
-    wide_df = pd.DataFrame(wide_rows)
+    # Compute EV + value
+    out = edited.copy()
+    out["EV_%"] = out.apply(lambda r: ev_percent(r["model_prob"], r["betfair_odds"], commission), axis=1)
+    out["Value"] = out["EV_%"].apply(lambda x: (not np.isnan(x)) and (x > 0.0))
 
-    # Pretty view
-    pretty = market_df.copy()
-    pretty["prob_%"] = pretty["prob"].apply(lambda x: fmt_prob(x, prob_decimals))
-    pretty["odds_dec"] = pretty["odds"].apply(lambda x: fmt_odds(x, odds_decimals))
-    pretty = pretty.drop(columns=["prob", "odds"])
+    # Pretty display
+    pretty = out.copy()
+    pretty["model_prob"] = pretty["model_prob"].apply(lambda x: fmt_prob(x, prob_decimals))
+    pretty["model_odds"] = pretty["model_odds"].apply(lambda x: fmt_odds(x, odds_decimals))
+    pretty["betfair_odds"] = pretty["betfair_odds"].apply(lambda x: "" if np.isnan(safe_float(x)) else fmt_odds(x, odds_decimals))
+    pretty["EV_%"] = pretty["EV_%"].apply(lambda x: "" if np.isnan(safe_float(x)) else f"{safe_float(x):.2f}%")
 
-    st.markdown("## Market prices (betting-style)")
-    st.dataframe(pretty, use_container_width=True)
+    if show_value_only:
+        pretty = pretty[pretty["Value"] == True]
 
+    st.markdown("### Value view")
+    st.dataframe(pretty[["fixture", "market", "selection", "model_prob", "model_odds", "betfair_odds", "EV_%", "Value"]], use_container_width=True)
+
+    # Quick summary
+    n_value = int(out["Value"].sum())
+    st.metric("Value selections", n_value)
+
+    # Downloads
     st.download_button(
-        "Download market_prices.csv",
-        data=market_df.to_csv(index=False).encode("utf-8"),
-        file_name="market_prices.csv",
+        "Download full table (with Betfair odds + EV)",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name="model_vs_betfair_ev.csv",
         mime="text/csv",
     )
 
-    if show_wide_table:
-        st.markdown("## Wide table (model-friendly)")
-        st.dataframe(wide_df, use_container_width=True)
-        st.download_button(
-            "Download forecasts_wide.csv",
-            data=wide_df.to_csv(index=False).encode("utf-8"),
-            file_name="forecasts_wide.csv",
-            mime="text/csv",
-        )
-
 # -------------------------
-# Tab: Help
+# Help tab
 # -------------------------
 with tab_help:
     st.markdown("### CSV formats")
-
     st.markdown("**results.csv required columns**")
     st.code("team_home, team_away, goals_home, goals_away", language="text")
-    st.markdown("Optional but recommended for time-decay:")
-    st.code("date", language="text")
-
-    st.markdown("**fixtures.csv required columns**")
+    st.markdown("Optional (recommended):")
+    st.code("date  (your format: 17/08/2024)", language="text")
+    st.markdown("**fixtures.csv required columns** (only used if you later add batch mode again)")
     st.code("team_home, team_away", language="text")
 
-    st.markdown("### Notes")
+    st.markdown("### EV% definition")
     st.markdown(
-        "- If you enable **time-decay**, your results file needs a usable `date` column. "
-        "The app will also let you filter the training window when `date` is present.\n"
-        "- If any fixtures error, it’s almost always a **team name mismatch** between results and fixtures.\n"
-        "- Exact Score / distributions require a newer `FootballProbabilityGrid` that exposes those methods."
+        "For £1 stake, with Betfair commission on winnings:\n\n"
+        "- net_return = 1 + (odds − 1) × (1 − commission)\n"
+        "- EV = p × net_return − 1\n"
+        "- EV% = 100 × EV\n\n"
+        "Value = EV% > 0"
     )
 
 
